@@ -1,0 +1,23 @@
+services:
+  fota:
+    build: .
+    image: fota-service:dev
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: sqlite:////data/fota.db
+      STORAGE_ROOT: /data/artifacts
+      CHUNK_SIZE: "262144"
+      SEED_DEMO: "true"
+      FAILURE_THRESHOLD: "0.2"
+      FAILURE_MIN_SAMPLE: "3"
+    volumes:
+      - fota-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  fota-data:
