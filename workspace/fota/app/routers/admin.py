@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import config, publishing, rollout, storage
+from .. import config, notarization, publishing, rollout, storage
 from ..db import get_session
 from ..models import (
     Assignment,
@@ -17,6 +17,10 @@ from ..models import (
     Device,
     DeviceEvent,
     Image,
+    NotaryCheckpoint,
+    NotaryEvidence,
+    NotaryLeaf,
+    QuarantinedModel,
     Release,
     RootMetadata,
     utcnow,
@@ -169,6 +173,88 @@ def list_releases(model: str | None = None, db: Session = Depends(get_session)):
             "created_at": r.created_at,
         }
         for r in db.scalars(q).all()
+    ]
+
+
+# ----- supply-chain notarization: ledger, evidence, quarantine -----
+@router.get("/notary/info")
+def notary_info(db: Session = Depends(get_session)):
+    """Notary public key + current signed checkpoint."""
+    info = notarization.notary_public_info()
+    cp = notarization.current_checkpoint(db)
+    return {
+        **info,
+        "tree_size": cp.tree_size if cp else 0,
+        "root_hash": cp.root_hash if cp else None,
+        "signature": cp.signature if cp else None,
+    }
+
+
+@router.get("/notary/tree")
+def notary_tree(db: Session = Depends(get_session)):
+    """Full ledger view for operators: every canonical leaf + every signed
+    checkpoint. Devices never need this — their proofs are O(log n)."""
+    leaves = db.scalars(select(NotaryLeaf).order_by(NotaryLeaf.leaf_index.asc())).all()
+    checkpoints = db.scalars(
+        select(NotaryCheckpoint).order_by(NotaryCheckpoint.tree_size.asc())
+    ).all()
+    return {
+        "tree_size": len(leaves),
+        "leaves": [
+            {
+                "leaf_index": l.leaf_index,
+                "entry_type": l.entry_type,
+                "ref_id": l.ref_id,
+                "entry": json.loads(l.entry_json),
+                "leaf_hash": l.leaf_hash,
+                "created_at": l.created_at,
+            }
+            for l in leaves
+        ],
+        "checkpoints": [
+            {
+                "tree_size": c.tree_size,
+                "root_hash": c.root_hash,
+                "signature": c.signature,
+                "created_at": c.created_at,
+            }
+            for c in checkpoints
+        ],
+    }
+
+
+@router.get("/notary/evidence")
+def notary_evidence(model: str | None = None, db: Session = Depends(get_session)):
+    """Suspicious notary material reported by devices (content-deduped)."""
+    q = select(NotaryEvidence).order_by(NotaryEvidence.id.asc())
+    if model:
+        q = q.where(NotaryEvidence.model == model)
+    return [
+        {
+            "id": e.id,
+            "evidence_hash": e.evidence_hash,
+            "device_id": e.device_id,
+            "model": e.model,
+            "kind": e.kind,
+            "evidence": json.loads(e.detail_json),
+            "created_at": e.created_at,
+        }
+        for e in db.scalars(q).all()
+    ]
+
+
+@router.get("/notary/quarantine")
+def notary_quarantine(db: Session = Depends(get_session)):
+    """Models under permanent notary quarantine."""
+    rows = db.scalars(select(QuarantinedModel).order_by(QuarantinedModel.created_at.asc())).all()
+    return [
+        {
+            "model": r.model,
+            "reason": r.reason,
+            "evidence_hash": r.evidence_hash,
+            "created_at": r.created_at,
+        }
+        for r in rows
     ]
 
 

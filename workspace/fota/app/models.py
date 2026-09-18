@@ -212,3 +212,62 @@ class Release(Base):
     __table_args__ = (
         UniqueConstraint("model", "version", name="uq_release_model_version"),
     )
+
+
+# --- supply-chain notarization: append-only Merkle ledger + quarantine -------
+class NotaryLeaf(Base):
+    """One canonically-encoded entry appended to the Merkle tree tail. Leaves
+    are insert-only by construction: `leaf_index` is the append position and
+    doubles as the primary key, so a rewrite/reorder is a key conflict."""
+    __tablename__ = "notary_leaves"
+
+    leaf_index: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    entry_type: Mapped[str] = mapped_column(String(16), nullable=False)  # root | release
+    ref_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entry_json: Mapped[str] = mapped_column(Text, nullable=False)        # canonical JSON
+    leaf_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("entry_type", "ref_id", name="uq_notary_leaf_entry"),
+    )
+
+
+class NotaryCheckpoint(Base):
+    """One signed checkpoint per tree size. Written in the SAME transaction as
+    the leaf it summarizes, so a published leaf never lacks a checkpoint and a
+    checkpoint never references an unpublished leaf."""
+    __tablename__ = "notary_checkpoints"
+
+    tree_size: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    root_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    signature: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NotaryEvidence(Base):
+    """Suspicious notary material reported by a verifying device. Deduped by
+    content hash: the same material reported any number of times (by any
+    number of devices) is stored exactly once."""
+    __tablename__ = "notary_evidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False)       # canonical JSON
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class QuarantinedModel(Base):
+    """Permanent observation quarantine for one model. Once a row exists, new
+    fetches for the model are refused fleet-wide; the row is never deleted by
+    the service (operators inspect evidence out of band)."""
+    __tablename__ = "quarantined_models"
+
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(48), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

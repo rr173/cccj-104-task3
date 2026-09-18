@@ -8,6 +8,14 @@ It models the parts the problem statement cares about:
   version + highest accepted security counter) and validates the signed
   release envelope — trust chain, signatures, expiry, artifact digest and
   counter — BEFORE entering the critical write phase
+* supply-chain notarization: every offer carries the release's Merkle
+  membership proof plus the consistency path from the device's stored
+  checkpoint; the device verifies BOTH before touching the standby slot and
+  commits the new signed checkpoint together with the fetch result as ONE
+  atomic state change (tmp file + rename). Notary misbehavior (split-view
+  checkpoint, shrunk tree, broken consistency, tampered proof bytes) is
+  reported as content-deduped evidence and fails closed: the active boot
+  slot is never touched
 * rejection fails closed: the active boot slot is never touched and the device
   posts a durable, idempotent `release_rejected` receipt
 * A/B slot install: on failure the new slot is marked bad, the device boots the
@@ -27,6 +35,7 @@ from pathlib import Path
 
 import httpx
 
+from app import notary as notarylib
 from app import trust as trustlib
 
 
@@ -61,6 +70,7 @@ class SimDevice:
         self._offer: dict | None = None
         self._clock: float | None = None  # tests may pin/advance the device clock
         self._trust: trustlib.TrustStore | None = None
+        self._notary: dict | None = None  # persisted verified checkpoint state
         self._idem = self._load_idem()
         self._load_persisted_state()  # survive process restart / power loss
 
@@ -81,6 +91,7 @@ class SimDevice:
             self.active_slot = st["active_slot"]
             self.facts["current_version"] = st["current_version"]
         self._trust = self._load_trust()
+        self._notary = self._load_notary()
 
     def _save_state(self) -> None:
         self._state_path.write_text(
@@ -109,6 +120,25 @@ class SimDevice:
         tmp = self._trust_path.with_name(self._trust_path.name + ".tmp")
         tmp.write_text(json.dumps(trust.to_dict()))
         os.replace(tmp, self._trust_path)
+
+    # ----- persisted notary state (verified checkpoint + accepted fetch) -----
+    @property
+    def _notary_path(self) -> Path:
+        return self.workdir / "notary.json"
+
+    def _load_notary(self) -> dict | None:
+        if self._notary_path.exists():
+            return json.loads(self._notary_path.read_text())
+        return None
+
+    def _write_notary_atomic(self, state: dict) -> None:
+        """The new checkpoint and the fetch result it authorizes are ONE
+        indivisible state change: a single tmp-file + rename. A power cut
+        leaves either the old checkpoint with the old fetch view, or the new
+        pair — never a checkpoint that outlives the fetch it approved."""
+        tmp = self._notary_path.with_name(self._notary_path.name + ".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, self._notary_path)
 
     # ----- persistence / idempotency keys -----
     @property
@@ -209,18 +239,161 @@ class SimDevice:
 
     def check_in(self):
         root_version = self._trust.root_version if self._trust else 0
+        tree_size = self._notary["tree_size"] if self._notary else 0
         r = self.client.post(
             "/api/device/check-in",
-            headers={**self._h(), "X-Root-Version": str(root_version)},
+            headers={
+                **self._h(),
+                "X-Root-Version": str(root_version),
+                "X-Notary-Tree-Size": str(tree_size),
+            },
         )
         r.raise_for_status()
         body = r.json()
+        notary_key = self._pin_notary_key(body.get("notary") or {})
         chain = ((body.get("trust") or {}).get("root_chain")) or []
         if chain:
             self._apply_root_chain(chain)
         if body.get("offer"):
+            # Verify BOTH notary proofs before the offer may be used; the new
+            # checkpoint and the accepted fetch commit as one atomic change.
+            self._accept_offer(body["offer"], notary_key)
             self._offer = body["offer"]
         return body
+
+    # ----- supply-chain notarization: pin, verify, commit, report -----
+    def _pin_notary_key(self, info: dict) -> str | None:
+        """TOFU-pin the notary public key. A key that changes under a pinned
+        device is itself evidence of a notary compromise — fail closed."""
+        served = info.get("public_key")
+        pinned = (self._notary or {}).get("notary_public")
+        if served and pinned and served != pinned:
+            self._report_notary_evidence(
+                notarylib.KIND_CHECKPOINT_SIG,
+                {
+                    "detail": "notary key changed",
+                    "pinned_key": pinned,
+                    "served_key": served,
+                },
+            )
+            raise notarylib.NotaryError(
+                notarylib.KIND_CHECKPOINT_SIG, "notary key changed"
+            )
+        return pinned or served
+
+    def _accept_offer(self, offer: dict, notary_key: str | None) -> None:
+        """Verify the offer's membership + consistency proofs, then commit the
+        new checkpoint and the fetch result atomically. Any cryptographic
+        failure is reported as evidence and fails closed BEFORE any download
+        or flash write."""
+        proof = offer.get("notary")
+        envelope = offer.get("release")
+        if not isinstance(proof, dict) or not isinstance(envelope, dict):
+            # Absent/malformed notary section: reject locally (no quarantine —
+            # there is no signed misbehavior to prove yet), never touch flash.
+            self._post_rejection(
+                trustlib.MISSING_METADATA, "offer carries no notary proof", None
+            )
+            raise trustlib.TrustError(
+                trustlib.MISSING_METADATA, "offer carries no notary proof"
+            )
+
+        checkpoint = proof.get("checkpoint") or {}
+        stored = self._notary
+
+        def bail(kind: str, detail: str, extra: dict | None = None):
+            evidence = {
+                "detail": detail,
+                "stored_checkpoint": (
+                    {"tree_size": stored["tree_size"], "root_hash": stored["root_hash"]}
+                    if stored
+                    else None
+                ),
+                "served_checkpoint": {
+                    "tree_size": checkpoint.get("tree_size"),
+                    "root_hash": checkpoint.get("root_hash"),
+                },
+                "served_signature": checkpoint.get("signature"),
+                "leaf_index": proof.get("leaf_index"),
+                "inclusion": proof.get("inclusion"),
+                "consistency": proof.get("consistency"),
+                "entry": proof.get("entry"),
+            }
+            if extra:
+                evidence.update(extra)
+            self._report_notary_evidence(kind, evidence)
+            raise notarylib.NotaryError(kind, detail)
+
+        # 1. The checkpoint must be signed by the pinned notary key.
+        if not notary_key or not notarylib.verify_checkpoint_signature(checkpoint, notary_key):
+            bail(notarylib.KIND_CHECKPOINT_SIG, "checkpoint signature invalid")
+
+        new_size = int(checkpoint["tree_size"])
+        new_root = str(checkpoint["root_hash"])
+        if stored is not None:
+            old_size = int(stored["tree_size"])
+            old_root = str(stored["root_hash"])
+            # 2. The tree only grows: a smaller tree is a rollback attempt.
+            if new_size < old_size:
+                bail(notarylib.KIND_TREE_SHRANK, f"{new_size} < stored {old_size}")
+            # 3. Same size must mean the same root (split-view detection).
+            if new_size == old_size and new_root != old_root:
+                bail(notarylib.KIND_SPLIT_VIEW, "same tree size, different root")
+            # 4. Growth must connect the stored history to the new checkpoint.
+            if new_size > old_size and not notarylib.verify_consistency(
+                old_size, old_root, new_size, new_root, proof.get("consistency") or []
+            ):
+                bail(notarylib.KIND_CONSISTENCY, "old entries cannot be connected")
+
+        # 5. The notarized entry must be the offered release itself ...
+        entry = proof.get("entry")
+        expected = trustlib.envelope_hash(
+            envelope.get("metadata") or {}, envelope.get("signatures") or []
+        )
+        if not isinstance(entry, dict) or entry.get("content_hash") != expected:
+            bail(notarylib.KIND_INCLUSION, "entry does not bind the offered release")
+        # 6. ... and must sit inside the checkpoint's tree (tamper check).
+        try:
+            leaf_index = int(proof.get("leaf_index"))
+        except (TypeError, ValueError):
+            leaf_index = -1
+        if not notarylib.verify_inclusion(
+            entry, leaf_index, new_size, proof.get("inclusion") or [], new_root
+        ):
+            bail(notarylib.KIND_INCLUSION, "membership proof does not verify")
+
+        # All proofs verified: commit {checkpoint + fetch result} atomically.
+        self._write_notary_atomic(
+            {
+                "tree_size": new_size,
+                "root_hash": new_root,
+                "notary_public": notary_key,
+                "accepted": {
+                    "assignment_id": offer.get("assignment_id"),
+                    "image_sha256": offer.get("image_sha256"),
+                    "leaf_index": proof.get("leaf_index"),
+                    "entry_hash": notarylib.leaf_hash(entry),
+                },
+            }
+        )
+        self._notary = self._load_notary()
+
+    def _report_notary_evidence(self, kind: str, evidence: dict) -> None:
+        """Durable, content-deduped misbehavior report. The idempotency key is
+        derived from the material itself, so reconnect replays and repeated
+        detections of the same material never create a second copy."""
+        material = {"kind": kind, "model": self.facts["model"], "evidence": evidence}
+        key = "nev-" + hashlib.sha256(
+            trustlib.canonical_json(material)
+        ).hexdigest()[:32]
+        try:
+            self.client.post(
+                "/api/device/notary-evidence",
+                headers=self._h(),
+                json={"kind": kind, "evidence": evidence, "idempotency_key": key},
+            )
+        except Exception:
+            pass  # never mask the original detection
 
     def _apply_root_chain(self, chain: list[dict]):
         """Validate every link of a root-rotation chain, then commit the new

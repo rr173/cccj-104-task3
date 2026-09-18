@@ -29,3 +29,10 @@ FAILURE_MIN_SAMPLE = _int("FAILURE_MIN_SAMPLE", 3)
 
 # Seed a demo image on first boot (used by scripts/demo.sh).
 SEED_DEMO = os.environ.get("SEED_DEMO", "false").lower() in ("1", "true", "yes")
+
+# Notary signing key for Merkle checkpoints. Lives next to the DB like the
+# demo keys; production would hold it in an HSM/KMS and only expose the public
+# half. Devices pin the public key on first contact (TOFU).
+NOTARY_KEY_PATH = Path(
+    os.environ.get("NOTARY_KEY_PATH", str(Path(STORAGE_ROOT).parent / "notary_key.json"))
+)

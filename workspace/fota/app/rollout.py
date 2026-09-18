@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import publishing
+from . import notarization, publishing
 from .models import (
     ALLOWED_TRANSITIONS,
     BATCH_ACTIVE,
@@ -60,6 +60,7 @@ REASON_BATCH_HALTED = "batch_halted"
 REASON_QUOTA_FULL = "quota_full"
 REASON_TERMINAL = "terminal"
 REASON_NO_SIGNED_RELEASE = "no_signed_release"
+REASON_MODEL_QUARANTINED = "model_quarantined"
 
 # Device receipts that move the FSM (telemetry-only events have no state entry).
 EVENT_TO_STATE: dict[str, str] = {
@@ -91,6 +92,14 @@ class GateError(Exception):
         self.batch_state = batch_state
 
 
+class QuarantineError(Exception):
+    """The device's model is in the notary quarantine: non-critical FSM
+    advancement is refused (critical-region devices may still finish)."""
+
+    def __init__(self):
+        super().__init__(REASON_MODEL_QUARANTINED)
+
+
 @dataclass
 class Offer:
     assignment_id: str
@@ -109,6 +118,11 @@ class Offer:
     # client must finish the pending install and then report. Never abort.
     finalize_only: bool = False
     install_state: str = STATE_ASSIGNED
+    # Notary proofs for the offered release: membership of the release's own
+    # ledger leaf + the consistency path from the device's stored checkpoint
+    # to the current signed checkpoint. The device verifies BOTH before any
+    # flash write and commits the new checkpoint atomically with the fetch.
+    notary: dict | None = None
 
 
 @dataclass
@@ -155,7 +169,9 @@ def _manifest_chunks(image: Image) -> list[dict]:
     ]
 
 
-def _make_offer(db: Session, device: Device, assignment: Assignment, image: Image) -> Offer:
+def _make_offer(
+    db: Session, device: Device, assignment: Assignment, image: Image, device_tree_size: int = 0
+) -> Offer:
     rel = publishing.release_for_image(db, image.id)
     return Offer(
         assignment_id=assignment.id,
@@ -172,6 +188,8 @@ def _make_offer(db: Session, device: Device, assignment: Assignment, image: Imag
         release=publishing.release_envelope(rel) if rel is not None else None,
         finalize_only=assignment.install_state in PAST_DOWNLOAD_STATES,
         install_state=assignment.install_state,
+        # Log-sized notary proofs from the device's stored checkpoint forward.
+        notary=notarization.offer_proofs(db, rel, device_tree_size) if rel is not None else None,
     )
 
 
@@ -214,7 +232,9 @@ def _candidate_batches(db: Session, device: Device) -> list[tuple[Batch, Campaig
 # ----------------------------------------------------------------------------- #
 # Check-in
 # ----------------------------------------------------------------------------- #
-def check_in(db: Session, device: Device, device_root_version: int = 0) -> CheckInResult:
+def check_in(
+    db: Session, device: Device, device_root_version: int = 0, device_tree_size: int = 0
+) -> CheckInResult:
     # Serialize the whole read-modify-write: prevents two concurrent check-ins
     # of the same device from racing, and keeps per-process seat claims atomic.
     # The UNIQUE(device,campaign) constraint remains the durable backstop.
@@ -226,6 +246,12 @@ def check_in(db: Session, device: Device, device_root_version: int = 0) -> Check
         # that slept through several rotations catches up in one wake-up. The
         # bundle rides along on every check-in, offered or not.
         trust = publishing.trust_bundle(db, max(0, device_root_version))
+
+        # Notary quarantine is permanent and fleet-wide for the model. A
+        # device already inside the flash critical region is still allowed to
+        # finish and report (never stranded mid-write); every other fetch for
+        # the model is refused.
+        quarantined = notarization.is_quarantined(db, device.model)
 
         # Existing ledger rows for this device get first say (pause/finish safety).
         existing = db.scalars(
@@ -243,7 +269,12 @@ def check_in(db: Session, device: Device, device_root_version: int = 0) -> Check
             if asg.install_state in CRITICAL_STATES:
                 # Flash writes in progress: always allow finishing + reporting.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+                return CheckInResult(
+                    device, _make_offer(db, device, asg, image, device_tree_size), trust=trust
+                )
+            if quarantined:
+                db.commit()
+                return CheckInResult(device, None, REASON_MODEL_QUARANTINED, trust=trust)
             if batch.state == BATCH_PAUSED:
                 db.commit()
                 return CheckInResult(device, None, REASON_BATCH_PAUSED, trust=trust)
@@ -254,13 +285,19 @@ def check_in(db: Session, device: Device, device_root_version: int = 0) -> Check
                 # assigned/downloading/downloaded: serve manifest so the client
                 # resumes verified blocks or proceeds to install.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+                return CheckInResult(
+                    device, _make_offer(db, device, asg, image, device_tree_size), trust=trust
+                )
+
+        if quarantined:
+            db.commit()
+            return CheckInResult(device, None, REASON_MODEL_QUARANTINED, trust=trust)
 
         # No live assignment: claim a seat in an active batch.
-        return _claim_new(db, device, trust)
+        return _claim_new(db, device, trust, device_tree_size)
 
 
-def _claim_new(db: Session, device: Device, trust: dict) -> CheckInResult:
+def _claim_new(db: Session, device: Device, trust: dict, device_tree_size: int = 0) -> CheckInResult:
     candidates = _candidate_batches(db, device)
     if not candidates:
         db.commit()
@@ -295,7 +332,9 @@ def _claim_new(db: Session, device: Device, trust: dict) -> CheckInResult:
             db.rollback()
             return CheckInResult(device, None, REASON_QUOTA_FULL, trust=trust)
         db.refresh(asg)
-        return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+        return CheckInResult(
+            device, _make_offer(db, device, asg, image, device_tree_size), trust=trust
+        )
 
     db.commit()
     reason = REASON_NO_SIGNED_RELEASE if saw_unsigned else REASON_QUOTA_FULL
@@ -318,6 +357,9 @@ def authorize_chunk(
     batch = db.get(Batch, asg.batch_id)
     if asg.install_state in CRITICAL_STATES:
         return asg, image, None  # critical-region finish path stays open
+    device = db.get(Device, device_id)
+    if device is not None and notarization.is_quarantined(db, device.model):
+        return asg, None, "model_quarantined"
     if batch.state == BATCH_PAUSED:
         return asg, None, "batch_paused"
     if batch.state == BATCH_HALTED:
@@ -386,14 +428,16 @@ def record_event(
 
         # Pause/halt gate: a device that has not entered the flash critical
         # region must not advance; an installing device is allowed to report
-        # installed/failed so it can finish or roll back safely.
+        # installed/failed so it can finish or roll back safely. The notary
+        # quarantine gates the same way, permanently and per model.
         if asg is not None and new_state is not None:
             batch = db.get(Batch, asg.batch_id)
-            if (
-                old_state not in CRITICAL_STATES
-                and batch.state in (BATCH_PAUSED, BATCH_HALTED)
-            ):
-                raise GateError(batch.state)
+            if old_state not in CRITICAL_STATES:
+                dev = db.get(Device, device_id)
+                if dev is not None and notarization.is_quarantined(db, dev.model):
+                    raise QuarantineError()
+                if batch.state in (BATCH_PAUSED, BATCH_HALTED):
+                    raise GateError(batch.state)
             asg.install_state = new_state
             asg.updated_at = utcnow()
 

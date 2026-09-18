@@ -11,6 +11,14 @@
 长期离线的设备一次唤醒即可连续 traverse 多代轮换；所有拒绝都会留下
 **持久、可查询、重试幂等**的失败回执，且绝不触碰当前可启动槽。
 
+在此之上是一层**软件供应公证**：控制面每次登记信任交接（根轮换）或制品（签名发布）
+都把规范编码的条目**追加到 Merkle 树尾**并签发**公证钥匙签署的检查点**（同一事务，
+崩溃无中间态）；终端领取时收到**成员见证 + 自上次检查点以来的连续见证**（均为对数
+规模），先验证再触碰备用分区，并把新检查点与领取结果作为**一次原子状态变更**落盘；
+一旦发现**同树高不同根 / 树高缩小 / 历史无法衔接 / 见证被改**，终端上报疑点材料
+（内容去重、可查询），该机型被**永久置入观察禁区**——已动盘的设备允许收尾，
+未动盘的设备立即停下，服务重启后禁区依然生效。
+
 ## 快速开始（可复现入口）
 
 ```bash
@@ -27,7 +35,7 @@ docker run --rm fota-service:dev test -v
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --port 8080
-python -m pytest -q               # 41 项测试
+python -m pytest -q               # 51 项测试
 ```
 
 - `Dockerfile` 的 `ENTRYPOINT` 是 `entrypoint.sh`：无参数起 API；`test` 跑 pytest；
@@ -59,12 +67,24 @@ curl -X POST localhost:8080/api/admin/batches/<id>/action -d '{"action":"activat
 
 # 3. 终端侧（每次联网唤醒执行）
 curl -X POST localhost:8080/api/device/register -d '{"id":"term-1","model":"term-x1",...}'
-curl -X POST localhost:8080/api/device/check-in -H 'X-Device-Id: term-1' -H 'X-Root-Version: 1'
-#   offered=true 时返回分块清单（每块 offset/size/sha256）+ 签名发布信封；
+curl -X POST localhost:8080/api/device/check-in -H 'X-Device-Id: term-1' -H 'X-Root-Version: 1' \
+     -H 'X-Notary-Tree-Size: 2'
+#   offered=true 时返回分块清单（每块 offset/size/sha256）+ 签名发布信封
+#   + offer.notary（成员见证 + 签名检查点 + 自 X-Notary-Tree-Size 以来的连续见证）；
 #   trust.root_chain 携带设备缺失的根链链接（离线期间的轮换一次补齐）
 curl 'localhost:8080/api/device/artifacts/<img>/chunks/0?assignment_id=<a>' -H 'X-Device-Id: term-1'
 curl -X POST localhost:8080/api/device/events -H 'X-Device-Id: term-1' \
      -d '{"assignment_id":"<a>","event_type":"installed","idempotency_key":"<每设备每里程碑唯一>","payload":{...}}'
+
+# 4. 公证层：账本 / 检查点 / 疑点材料 / 观察禁区
+curl localhost:8080/api/admin/notary/info         # 公证公钥 + 当前签名检查点
+curl localhost:8080/api/admin/notary/tree         # 全部规范条目 + 全部签名检查点
+curl localhost:8080/api/admin/notary/evidence     # 设备上报的疑点材料（按内容去重）
+curl localhost:8080/api/admin/notary/quarantine   # 被永久置入观察禁区的机型
+#   终端检测到公证异常时：POST /api/device/notary-evidence
+#   {"kind":"checkpoint_root_mismatch|tree_shrank|consistency_proof_invalid|
+#           inclusion_proof_invalid|checkpoint_signature_invalid",
+#    "evidence":{...},"idempotency_key":"nev-<内容派生>"}
 ```
 
 交互文档：<http://localhost:8080/docs>
@@ -175,6 +195,30 @@ curl -X POST localhost:8080/api/device/events -H 'X-Device-Id: term-1' \
 - 同一 `(model, version)` 的发布内容唯一：不同内容冒名同一版本 → 409
   （`release_version_conflict` / `release_exists`）；根版本重写/跳号同样被拒绝。
 
+### 13. 软件供应公证（Merkle 追加账本 + 签名检查点 + 观察禁区）
+- **追加即公证**：`publish_root` / `publish_release` 在**同一个数据库事务**里完成
+  业务行写入 + 规范条目（canonical JSON）追加到 Merkle 树尾 + 公证钥匙签署新检查点
+  （`app/notarization.py`）。树结构为 RFC 6962 风格：叶 `SHA256(0x00‖entry)`、
+  内部节点 `SHA256(0x01‖L‖R)`（`app/notary.py`，服务端与终端共用，编码不可能漂移）。
+- **崩溃原子性**：强制杀进程只会留下"全部可见"或"全部不可见"——对外不存在
+  "能领取但账本无记录"的中间态；持同一请求令牌重试，最终至多一项完整登记和
+  一个树叶（叶索引即主键，是唯一性的持久兜底）。
+- **领取时的两类见证**：offer 的 `notary` 段携带该发布叶子的**成员见证**（审计路径）
+  和从设备上次记住的检查点（`X-Notary-Tree-Size` 头）到当前检查点的**连续见证**；
+  两者都是 O(log n) 个哈希——休眠再久的设备也绝不传输全量历史。
+- **先验证，再动盘，原子落盘**：终端依次校验检查点签名（公证公钥 TOFU 锚定）→
+  树高不回缩 → 同高必同根 → 连续见证衔接 → 条目绑定发布信封 → 成员见证成立；
+  全部通过才把 `{新检查点 + 领取结果}` 作为**一次 tmp+rename 原子写**落盘
+  （`notary.json`），随后才允许下载/刷写。
+- **观察禁区**：检测到同高不同根、树高缩小、历史无法衔接、见证字节被改或检查点
+  签名无效时，终端把疑点材料 POST 到 `/api/device/notary-evidence`（幂等键由材料
+  内容派生）；服务端按内容哈希去重（**同一材料反复提交只保存一份**）并把该机型
+  **永久**置入禁区（`quarantined_models`，纯 DB 状态，进程重启后仍生效）。
+  禁区语义与暂停/熔断同构：已进关键区（installing）的设备允许收尾并回执，
+  其余设备的领取/块下载/状态推进全部被拒（`model_quarantined`）。
+- 公证私钥落盘位置由 `NOTARY_KEY_PATH` 决定（默认随数据卷），生产应放 HSM/KMS；
+  设备端只锚定公钥。
+
 ## 数据模型（`app/models.py`）
 
 ```
@@ -193,11 +237,17 @@ root_metadata(version, metadata_json, signatures_json,
 releases(id, image_id, model, version, artifact_sha256, security_counter,
          expires_at, metadata_json, signatures_json, content_hash,
          idempotency_key)                              -- UNIQUE(model,version), UNIQUE(image)
+notary_leaves(leaf_index, entry_type, ref_id, entry_json, leaf_hash)
+                                                       -- 叶索引即主键：只追加，不改写
+notary_checkpoints(tree_size, root_hash, signature)    -- 每个树高一行的签名检查点
+notary_evidence(id, evidence_hash, device_id, model, kind, detail_json,
+                idempotency_key)                       -- UNIQUE(evidence_hash)：材料去重
+quarantined_models(model, reason, evidence_hash)       -- 机型即主键：永久禁区
 ```
 
 ## 验证矩阵
 
-`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（41 项）：
+`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（51 项）：
 
 | 关注点 | 测试文件 |
 |---|---|
@@ -208,12 +258,16 @@ releases(id, image_id, model, version, artifact_sha256, security_counter,
 | 越阈熔断、级联停扩散、阈值边界、原因留档 | `tests/test_failure_halt.py` |
 | 回执重放、8 路并发重复上线、名额竞争、乱序拒绝 | `tests/test_idempotency.py` |
 | 签名发布安装、篡改元数据/块拒绝、过期/吊销/计数器回滚、多代轮换、缺环失败闭合、轮换中断收敛、并发发布幂等、退休根拒绝、暂停门保持 | `tests/test_signing.py` |
+| Merkle 数学自检、首登成员见证+切槽、休眠设备对数追赶、翻转见证/抽历史/小树高/分裂视图禁区、疑点去重、崩溃无孤儿无双叶、6 并发同令牌一叶、禁区下动盘收尾 | `tests/test_notary.py` |
 
 真实 HTTP 进程端到端（非 TestClient）也已验证：断 1 块后唤醒只拉剩余块、
 暂停中途唤醒返回 `batch_paused`、恢复后续传并安装、2/2 失败自动熔断并级联阶段 3、
 失败设备影子版本回滚、安装成功版本跨进程重启保持；
 签名链路同样过了真实进程验证：种子根链 + 签名发布安装、篡改拒绝回执、
 服务端重启后根链/发布/回执/设备信任状态全部保持、离线轮换 v1→v2 一次唤醒收敛。
+公证链路的真实进程验证（`scripts/e2e_notary.py`，起真实 uvicorn + 真实设备进程）：
+种子发布带可验证成员见证完成切槽、分裂视图证据使机型进禁区且证据去重、
+**服务进程重启后禁区与账本原样保持**、新领取持续被拒。
 
 ## 配置（环境变量）
 
@@ -225,12 +279,17 @@ releases(id, image_id, model, version, artifact_sha256, security_counter,
 | `FAILURE_THRESHOLD` / `FAILURE_MIN_SAMPLE` | 0.2 / 3 | 批次默认熔断阈值与最小样本 |
 | `SEED_DEMO` | false | 启动时种入一个演示镜像 + 金丝雀批次（compose 开启） |
 | `DEMO_KEYS_PATH` | `<STORAGE_ROOT>/../demo_keys.json` | 演示用签名密钥对的落盘位置（仅 demo；生产私钥应离线保管） |
+| `NOTARY_KEY_PATH` | `<STORAGE_ROOT>/../notary_key.json` | 公证签名钥匙的落盘位置（生产应放 HSM/KMS，设备只锚定公钥） |
 
 ## 生产化备注（本实现刻意留出的边界）
 
 - 鉴权：管理端应加运营 SSO/角色，设备端用设备证书/签名令牌（当前为裸 header，便于演示）。
 - 信任根引导：设备首用信任（TOFU）自签名的 root v1；生产应在出厂时预置 root v1 公钥，
   并用 HSM/KMS 保管根私钥，发布签名保持离线。
+- 公证钥匙同理：生产放 HSM/KMS 且只出公钥；检查点可在设备间 gossip 交叉验证，
+  或镜像到独立见证方（witness cosigning）以缩短分裂视图的检测时延。
 - 规模：单 worker + 进程锁 + sqlite 用于可复现演示；多实例部署切 Postgres，
-  将名额领取改为批次行 `SELECT … FOR UPDATE`，块对象放 S3/CDN（块内容寻址且 immutable，可直接缓存）。
+  将名额领取改为批次行 `SELECT … FOR UPDATE`，账本叶索引用计数器行同样加行锁，
+  子树哈希可做 tile 缓存（叶表已含全部重建材料），块对象放 S3/CDN
+  （块内容寻址且 immutable，可直接缓存）。
 - 回执可加老化归档；`assignments` 建议按 (campaign, device) 分区。

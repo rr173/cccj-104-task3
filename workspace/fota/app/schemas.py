@@ -50,6 +50,16 @@ class OfferOut(BaseModel):
     # Signed release envelope the device must validate before the critical
     # write phase (None only defensively — unsigned images are never offered).
     release: Envelope | None = None
+    # Notary proofs: {entry, leaf_index, inclusion[], checkpoint, consistency[]}.
+    # The device verifies both proofs BEFORE touching the standby slot and
+    # commits the new checkpoint atomically with the fetch result.
+    notary: dict[str, Any] | None = None
+
+
+class NotaryInfo(BaseModel):
+    """The notary public key devices pin (TOFU) to verify checkpoints."""
+    key_id: str
+    public_key: str
 
 
 class CheckInResponse(BaseModel):
@@ -58,6 +68,7 @@ class CheckInResponse(BaseModel):
     reason: str | None = None
     offer: OfferOut | None = None
     trust: TrustBundle | None = None
+    notary: NotaryInfo | None = None
     server_time: datetime
 
 
@@ -76,6 +87,14 @@ class EventOut(BaseModel):
     from_state: str | None = None
     to_state: str | None = None
     halted_batch_ids: list[str] = Field(default_factory=list)
+
+
+class NotaryEvidenceIn(BaseModel):
+    """Suspicious notary material reported by a verifying device. The service
+    dedupes by content and permanently quarantines the reporting model."""
+    kind: str = Field(min_length=1, max_length=48)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = Field(min_length=8, max_length=120)
 
 
 # ----- admin side -----

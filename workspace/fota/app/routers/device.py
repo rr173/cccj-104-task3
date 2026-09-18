@@ -8,10 +8,18 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import rollout, storage
+from .. import notarization, rollout, storage
 from ..db import get_session
 from ..models import Device, DeviceEvent, utcnow
-from ..schemas import CheckInResponse, EventIn, EventOut, OfferOut, RegisterIn, TrustBundle
+from ..schemas import (
+    CheckInResponse,
+    EventIn,
+    EventOut,
+    NotaryEvidenceIn,
+    OfferOut,
+    RegisterIn,
+    TrustBundle,
+)
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
@@ -50,11 +58,18 @@ def check_in(
     db: Session = Depends(get_session),
     x_device_id: str | None = Header(default=None),
     x_root_version: int | None = Header(default=None),
+    x_notary_tree_size: int | None = Header(default=None),
 ) -> CheckInResponse:
     device = _device_or_404(db, _device_id_header(x_device_id))
-    # The device reports the root version it currently trusts; the service
-    # returns every chain link above it so the device catches up atomically.
-    result = rollout.check_in(db, device, device_root_version=x_root_version or 0)
+    # The device reports the root version it currently trusts and the notary
+    # checkpoint it last verified; the service returns the chain links and the
+    # log-sized consistency path above them so the device catches up atomically.
+    result = rollout.check_in(
+        db,
+        device,
+        device_root_version=x_root_version or 0,
+        device_tree_size=max(0, x_notary_tree_size or 0),
+    )
     return CheckInResult_to_response(device, result)
 
 
@@ -67,6 +82,7 @@ def CheckInResult_to_response(device, result) -> CheckInResponse:  # noqa: N802
         reason=result.reason,
         offer=offer,
         trust=trust,
+        notary=notarization.notary_public_info(),
         server_time=utcnow(),
     )
 
@@ -86,7 +102,7 @@ def get_chunk(
     _asg, image, gate = rollout.authorize_chunk(db, device_id, assignment_id)
     if gate == "not_found":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assignment_not_found")
-    if gate in ("batch_paused", "batch_halted"):
+    if gate in ("batch_paused", "batch_halted", "model_quarantined"):
         raise HTTPException(status.HTTP_409_CONFLICT, gate)
     if gate == "terminal" or image is None or image.id != image_id:
         raise HTTPException(status.HTTP_410_GONE, "no_longer_available")
@@ -123,6 +139,8 @@ def post_event(
         )
     except LookupError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assignment_not_found")
+    except rollout.QuarantineError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     except rollout.GateError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     except rollout.StateError as e:
@@ -130,6 +148,30 @@ def post_event(
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     return EventOut(**out)
+
+
+@router.post("/notary-evidence")
+def post_notary_evidence(
+    body: NotaryEvidenceIn,
+    db: Session = Depends(get_session),
+    x_device_id: str | None = Header(default=None),
+):
+    """A verifying device reports notary misbehavior (split-view checkpoint,
+    shrunk tree, broken consistency, tampered membership proof). The material
+    is stored once per distinct content and the device's model is quarantined
+    permanently; reporting is always allowed, even for quarantined models."""
+    device = _device_or_404(db, _device_id_header(x_device_id))
+    try:
+        return notarization.record_evidence(
+            db,
+            device_id=device.id,
+            model=device.model,
+            kind=body.kind,
+            evidence=body.evidence,
+            idempotency_key=body.idempotency_key,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
 
 @router.get("/events")

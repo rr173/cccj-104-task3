@@ -273,6 +273,7 @@ def make_device(client, tmp_path):
         d._offer = None
         d._clock = kw.get("clock")  # tests may pin/advance the device clock
         d._trust = None
+        d._notary = None
         d._idem = d._load_idem()
         d._load_persisted_state()
         return d

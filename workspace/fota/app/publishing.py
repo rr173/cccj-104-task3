@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import notarization
 from . import trust as trustlib
 from .models import Image, Release, RootMetadata
 
@@ -95,7 +96,7 @@ def release_envelope(rel: Release) -> dict:
 # --------------------------------------------------------------------------- #
 # Root chain publication
 # --------------------------------------------------------------------------- #
-def _root_out(row: RootMetadata, *, duplicate: bool) -> dict:
+def _root_out(db: Session, row: RootMetadata, *, duplicate: bool) -> dict:
     return {
         "version": row.version,
         "metadata": json.loads(row.metadata_json),
@@ -103,6 +104,9 @@ def _root_out(row: RootMetadata, *, duplicate: bool) -> dict:
         "content_hash": row.content_hash,
         "idempotency_key": row.idempotency_key,
         "duplicate": duplicate,
+        # Ledger membership proof for this handoff, verifiable against the
+        # returned signed checkpoint.
+        "notary": notarization.publication_proofs(db, "root", row.version),
         "created_at": row.created_at.isoformat(),
     }
 
@@ -116,7 +120,7 @@ def publish_root(db: Session, *, metadata: dict, signatures: list, idempotency_k
         if dup is not None:
             if dup.content_hash != chash:
                 raise Conflict("idempotency_key_conflict")
-            return _root_out(dup, duplicate=True)
+            return _root_out(db, dup, duplicate=True)
 
         cur = current_root(db)
         try:
@@ -143,6 +147,9 @@ def publish_root(db: Session, *, metadata: dict, signatures: list, idempotency_k
             idempotency_key=idempotency_key,
         )
         db.add(row)
+        # Notarize the handoff: canonical entry appended to the Merkle tail +
+        # signed checkpoint, staged in the SAME transaction as the root row.
+        notarization.append_entry(db, "root", version, notarization.root_entry(version, chash))
         try:
             db.commit()
         except IntegrityError:
@@ -151,15 +158,15 @@ def publish_root(db: Session, *, metadata: dict, signatures: list, idempotency_k
                 select(RootMetadata).where(RootMetadata.idempotency_key == idempotency_key)
             )
             if row is not None and row.content_hash == chash:
-                return _root_out(row, duplicate=True)
+                return _root_out(db, row, duplicate=True)
             raise Conflict("root_version_conflict")
-        return _root_out(row, duplicate=False)
+        return _root_out(db, row, duplicate=False)
 
 
 # --------------------------------------------------------------------------- #
 # Release publication
 # --------------------------------------------------------------------------- #
-def _release_out(row: Release, *, duplicate: bool) -> dict:
+def _release_out(db: Session, row: Release, *, duplicate: bool) -> dict:
     return {
         "id": row.id,
         "image_id": row.image_id,
@@ -173,6 +180,8 @@ def _release_out(row: Release, *, duplicate: bool) -> dict:
         "content_hash": row.content_hash,
         "idempotency_key": row.idempotency_key,
         "duplicate": duplicate,
+        # Ledger membership proof for this artifact registration.
+        "notary": notarization.publication_proofs(db, "release", row.id),
         "created_at": row.created_at.isoformat(),
     }
 
@@ -191,7 +200,7 @@ def publish_release(
         if dup is not None:
             if dup.content_hash != chash:
                 raise Conflict("idempotency_key_conflict")
-            return _release_out(dup, duplicate=True)
+            return _release_out(db, dup, duplicate=True)
 
         if not isinstance(metadata, dict) or metadata.get("type") != "release":
             raise Validation("malformed_release_metadata")
@@ -207,7 +216,7 @@ def publish_release(
         for_image = db.scalar(select(Release).where(Release.image_id == image.id))
         if for_image is not None:
             if for_image.content_hash == chash:
-                return _release_out(for_image, duplicate=True)
+                return _release_out(db, for_image, duplicate=True)
             raise Conflict("release_exists")
         same_version = db.scalar(
             select(Release).where(Release.model == image.model, Release.version == image.version)
@@ -255,12 +264,17 @@ def publish_release(
             idempotency_key=idempotency_key,
         )
         db.add(row)
+        db.flush()  # row.id is needed as the leaf's back-reference
+        # Notarize the artifact registration in the SAME transaction: a crash
+        # anywhere before the commit leaves neither the release nor the leaf,
+        # so a fetchable artifact without a ledger record can never exist.
+        notarization.append_entry(db, "release", row.id, notarization.release_entry(row))
         try:
             db.commit()
         except IntegrityError:
             db.rollback()
             row = db.scalar(select(Release).where(Release.idempotency_key == idempotency_key))
             if row is not None and row.content_hash == chash:
-                return _release_out(row, duplicate=True)
+                return _release_out(db, row, duplicate=True)
             raise Conflict("release_version_conflict")
-        return _release_out(row, duplicate=False)
+        return _release_out(db, row, duplicate=False)
