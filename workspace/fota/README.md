@@ -175,6 +175,35 @@ curl -X POST localhost:8080/api/device/events -H 'X-Device-Id: term-1' \
 - 同一 `(model, version)` 的发布内容唯一：不同内容冒名同一版本 → 409
   （`release_version_conflict` / `release_exists`）；根版本重写/跳号同样被拒绝。
 
+### 13. 软件供应公证（追加式 Merkle 账本 + 签名检查点）
+在既有离线签名之上再加一层**透明日志公证**，让节点独立判断"控制面是否对我撒过谎"：
+
+- **登记即追加**：每次登记信任交接（root 链）或二进制制品（release），都把一条
+  规范编码（canonical JSON）条目接到 **Merkle 追加树**尾端，并在**同一事务**里落
+  业务行 + 树叶 + 由**公证钥匙**（ed25519，独立于 root/release 钥匙）签署的检查点。
+  杀进程只可能让三者一起回滚——不存在"能领取但账本无记录"的中间态。
+- **领取携带双见证**：节点取制品时，offer 带①该条目的**成员见证**（inclusion
+  proof），②从节点上次记住的检查点到当前检查点的**连续见证**（consistency /
+  append-only proof）。叶子/节点哈希带 `0x00/0x01` 域分隔（RFC 9162 风格）。
+- **先验证后动盘**：节点先校验公证钥匙签名 → 连续见证（旧根能推出新根）→ 成员见证
+  （条目绑定本制品摘要/机型）→ 既有 release 五连校验，全部通过才把**新检查点与领取
+  结果作为一次原子状态变更**落盘（tmp+rename），随后才触碰备用分区。
+- **休眠节点只取对数规模见证**：连续见证 = 旧树的二进制分解前沿（popcount(m)
+  个哈希）+ 覆盖 `[m,n)` 的对齐扩展块，至多 `2·⌊log₂n⌋+1` 个哈希，跨任意多次增长
+  一次唤醒补齐，**绝不传输全量历史**。
+- **观察禁区（永久、跨重启）**：检测到
+  *同树高却根摘要不同的两个有效签名检查点*（只有持公证钥匙者能造，即明确的日志
+  equivocation）、*见证字节被篡改*、*历史条目无法衔接*、*树高缩小* 时，受影响机型被
+  **永久置入观察禁区**（普通持久表，进程重启后仍在）；新领取被拦截，疑点材料可查询
+  （`/api/admin/notary/suspicions`、`/quarantine`、`/leaves`、`/checkpoint`，
+  节点侧 `POST /api/device/notary/suspicions`）。同一材料按**内容哈希去重**，反复
+  提交只存一份。
+- **动盘收尾语义**：已进入 `installing` 关键区的节点照常给块/允许 `installed`/`failed`
+  收尾上报；尚未动盘（assigned/downloading）的节点在 check-in 与块接口两处都被拦下，
+  原活动分区保持可启动。
+- **幂等**：树叶的 `request_token`（复用发布幂等键）与叶子哈希均唯一；同一令牌并发/
+  重放至多产生一项完整登记和一片树叶，树高只增一次。
+
 ## 数据模型（`app/models.py`）
 
 ```
@@ -193,11 +222,18 @@ root_metadata(version, metadata_json, signatures_json,
 releases(id, image_id, model, version, artifact_sha256, security_counter,
          expires_at, metadata_json, signatures_json, content_hash,
          idempotency_key)                              -- UNIQUE(model,version), UNIQUE(image)
+notary_leaves(seq[1..], kind[root|release], ref, model, payload_sha256,
+              entry_json, leaf_hash, request_token)  -- UNIQUE(leaf_hash), UNIQUE(request_token)
+notary_checkpoints(id, tree_size, root, checkpoint_json, signatures_json,
+                   canonical)                         -- UNIQUE(tree_size,root); 备用=equivocation证据
+quarantined_models(model PK, reason, detail)         -- 永久观察禁区，跨重启
+notary_suspicions(id, device_id, model, kind, evidence_hash, evidence_json,
+                  duplicate)                          -- UNIQUE(evidence_hash)，同材料只一份
 ```
 
 ## 验证矩阵
 
-`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（41 项）：
+`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（56 项）：
 
 | 关注点 | 测试文件 |
 |---|---|
@@ -208,12 +244,16 @@ releases(id, image_id, model, version, artifact_sha256, security_counter,
 | 越阈熔断、级联停扩散、阈值边界、原因留档 | `tests/test_failure_halt.py` |
 | 回执重放、8 路并发重复上线、名额竞争、乱序拒绝 | `tests/test_idempotency.py` |
 | 签名发布安装、篡改元数据/块拒绝、过期/吊销/计数器回滚、多代轮换、缺环失败闭合、轮换中断收敛、并发发布幂等、退休根拒绝、暂停门保持 | `tests/test_signing.py` |
+| 成员见证+切槽、休眠节点跨多次增长的对数连续见证、翻转见证/抽历史/树高缩小动盘前关闭、同材料一份疑点、同高异根双签名进禁区且重启拒领、记录-树叶间崩溃无孤立无双叶、6 并发同令牌一叶、禁区动盘收尾/未动盘拦截、信任交接上链 | `tests/test_notarization.py` |
+| 真实 uvicorn 进程（非 TestClient）：成员见证过线、equivocation 后 SIGKILL 换进程，禁区/账本头/拒领在新进程全部保持 | `tests/test_notary_process.py` |
 
 真实 HTTP 进程端到端（非 TestClient）也已验证：断 1 块后唤醒只拉剩余块、
 暂停中途唤醒返回 `batch_paused`、恢复后续传并安装、2/2 失败自动熔断并级联阶段 3、
 失败设备影子版本回滚、安装成功版本跨进程重启保持；
 签名链路同样过了真实进程验证：种子根链 + 签名发布安装、篡改拒绝回执、
-服务端重启后根链/发布/回执/设备信任状态全部保持、离线轮换 v1→v2 一次唤醒收敛。
+服务端重启后根链/发布/回执/设备信任状态全部保持、离线轮换 v1→v2 一次唤醒收敛；
+公证链路的真实进程验证见 `tests/test_notary_process.py`（equivocation → SIGKILL →
+换进程禁区与账本保持）。
 
 ## 配置（环境变量）
 
@@ -225,6 +265,7 @@ releases(id, image_id, model, version, artifact_sha256, security_counter,
 | `FAILURE_THRESHOLD` / `FAILURE_MIN_SAMPLE` | 0.2 / 3 | 批次默认熔断阈值与最小样本 |
 | `SEED_DEMO` | false | 启动时种入一个演示镜像 + 金丝雀批次（compose 开启） |
 | `DEMO_KEYS_PATH` | `<STORAGE_ROOT>/../demo_keys.json` | 演示用签名密钥对的落盘位置（仅 demo；生产私钥应离线保管） |
+| `NOTARY_KEYS_PATH` | `<STORAGE_ROOT>/../notary_keys.json` | 公证签名钥匙对的落盘位置（仅 demo/单实例；生产私钥应进 HSM/KMS，节点出厂预置公钥） |
 
 ## 生产化备注（本实现刻意留出的边界）
 

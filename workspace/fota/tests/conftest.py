@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import config as appconfig  # noqa: E402
 from app import trust as trustlib  # noqa: E402
 from client import SimDevice  # noqa: E402
 
@@ -273,6 +274,8 @@ def make_device(client, tmp_path):
         d._offer = None
         d._clock = kw.get("clock")  # tests may pin/advance the device clock
         d._trust = None
+        d._notary = d._load_notary()
+        d.notary_rejection = None
         d._idem = d._load_idem()
         d._load_persisted_state()
         return d
@@ -282,3 +285,22 @@ def make_device(client, tmp_path):
 
 def h(dev_id):
     return {"X-Device-Id": dev_id}
+
+
+# --------------------------------------------------------------------------- #
+# Notary-key access (tests sign checkpoints the way an offline notary would)
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _isolate_notary_key(tmp_path, monkeypatch):
+    """Every test gets a fresh notary key file, independent of the DB reset."""
+    from app import notary_service
+
+    path = tmp_path / "notary_keys.json"
+    monkeypatch.setattr(appconfig, "NOTARY_KEYS_PATH", path)
+    yield
+
+
+def notary_key() -> dict:
+    from app import notary_service
+
+    return notary_service.notary_keys()

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import config, publishing, rollout, storage
+from .. import config, notary_service, publishing, rollout, storage
 from ..db import get_session
 from ..models import (
     Assignment,
@@ -17,6 +17,7 @@ from ..models import (
     Device,
     DeviceEvent,
     Image,
+    NotaryLeaf,
     Release,
     RootMetadata,
     utcnow,
@@ -354,5 +355,82 @@ def overview(db: Session = Depends(get_session)):
         "campaigns": int(db.scalar(select(func.count(Campaign.id))) or 0),
         "batches": int(db.scalar(select(func.count(Batch.id))) or 0),
         "assignments": int(db.scalar(select(func.count(Assignment.id))) or 0),
+        "notary_tree_size": notary_service.tree_size(db),
+        "quarantined_models": len(notary_service.list_quarantined(db)),
         "server_time": utcnow(),
+    }
+
+
+# ----- software-supply notarization ledger -----
+@router.get("/notary/checkpoint")
+def notary_head(db: Session = Depends(get_session)):
+    cp = notary_service.current_checkpoint(db)
+    if cp is None:
+        return {"tree_size": 0, "root": None, "checkpoint": None}
+    return {
+        "tree_size": cp.tree_size,
+        "root": cp.root,
+        "checkpoint": {
+            **json.loads(cp.checkpoint_json),
+            "signatures": json.loads(cp.signatures_json),
+        },
+        "key": notary_service.notary_public(),
+    }
+
+
+@router.get("/notary/leaves")
+def notary_leaves(db: Session = Depends(get_session)):
+    rows = db.scalars(select(NotaryLeaf).order_by(NotaryLeaf.seq.asc())).all()
+    return [
+        {
+            "seq": l.seq,
+            "kind": l.kind,
+            "ref": l.ref,
+            "model": l.model,
+            "payload_sha256": l.payload_sha256,
+            "entry": json.loads(l.entry_json),
+            "leaf_hash": l.leaf_hash,
+            "request_token": l.request_token,
+            "created_at": l.created_at,
+        }
+        for l in rows
+    ]
+
+
+@router.get("/notary/quarantine")
+def notary_quarantine(db: Session = Depends(get_session)):
+    return notary_service.list_quarantined(db)
+
+
+@router.get("/notary/suspicions")
+def notary_suspicions(
+    model: str | None = None,
+    kind: str | None = None,
+    db: Session = Depends(get_session),
+):
+    return notary_service.list_suspicions(db, model=model, kind=kind)
+
+
+@router.post("/notary/checkpoints/alternate")
+def notary_admit_alternate(body: dict, db: Session = Depends(get_session)):
+    """Equivocation intake: admit a SECOND checkpoint that is validly signed by
+    the notary key but binds a different root at an already-occupied tree size.
+    Such an object can only be produced by whoever holds the notary key, so it
+    is conclusive log equivocation — the evidence is retained and every model
+    in the compromised log is permanently quarantined (survives restarts)."""
+    cp = body.get("checkpoint") if isinstance(body, dict) else None
+    if not isinstance(cp, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "checkpoint_required")
+    try:
+        event = notary_service.admit_alternate_checkpoint(db, cp)
+    except notary_service.NotaryConflict as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    except Exception as e:  # signature/format failures -> 422
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    return {
+        "equivocation": True,
+        "tree_size": event.tree_size,
+        "canonical_root": event.canonical_root,
+        "alternate_root": event.alternate_root,
+        "quarantined_models": event.models,
     }

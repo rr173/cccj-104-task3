@@ -8,10 +8,19 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import rollout, storage
+from .. import notary_service, rollout, storage
 from ..db import get_session
 from ..models import Device, DeviceEvent, utcnow
-from ..schemas import CheckInResponse, EventIn, EventOut, OfferOut, RegisterIn, TrustBundle
+from ..schemas import (
+    CheckInResponse,
+    EventIn,
+    EventOut,
+    OfferOut,
+    RegisterIn,
+    SuspicionIn,
+    SuspicionOut,
+    TrustBundle,
+)
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
@@ -50,11 +59,19 @@ def check_in(
     db: Session = Depends(get_session),
     x_device_id: str | None = Header(default=None),
     x_root_version: int | None = Header(default=None),
+    x_notary_size: int | None = Header(default=None),
 ) -> CheckInResponse:
     device = _device_or_404(db, _device_id_header(x_device_id))
     # The device reports the root version it currently trusts; the service
     # returns every chain link above it so the device catches up atomically.
-    result = rollout.check_in(db, device, device_root_version=x_root_version or 0)
+    # It also reports the notary tree size it last remembered; the service
+    # returns the O(log n) continuity witness from that size to the current one.
+    result = rollout.check_in(
+        db,
+        device,
+        device_root_version=x_root_version or 0,
+        notary_old_size=max(0, x_notary_size or 0),
+    )
     return CheckInResult_to_response(device, result)
 
 
@@ -86,7 +103,7 @@ def get_chunk(
     _asg, image, gate = rollout.authorize_chunk(db, device_id, assignment_id)
     if gate == "not_found":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assignment_not_found")
-    if gate in ("batch_paused", "batch_halted"):
+    if gate in ("batch_paused", "batch_halted", "model_quarantined"):
         raise HTTPException(status.HTTP_409_CONFLICT, gate)
     if gate == "terminal" or image is None or image.id != image_id:
         raise HTTPException(status.HTTP_410_GONE, "no_longer_available")
@@ -159,3 +176,37 @@ def list_events(
         }
         for e in rows
     ]
+
+
+# ----- software-supply notarization -----
+@router.get("/notary/key")
+def get_notary_key(db: Session = Depends(get_session)):
+    """The pinned notary verification key a node uses to validate checkpoint
+    signatures (TOFU/pinned-at-manufacturing in production)."""
+    return notary_service.notary_public()
+
+
+@router.post("/notary/suspicions", response_model=SuspicionOut,
+             status_code=status.HTTP_201_CREATED)
+def report_suspicion(
+    body: SuspicionIn,
+    db: Session = Depends(get_session),
+    x_device_id: str | None = Header(default=None),
+) -> SuspicionOut:
+    """A node reports failed witness verification (tampered witness bytes,
+    unlinkable history, tree shrink, or same-height/different-root checkpoints).
+
+    The evidence content-hash is the dedup key: submitting the same material
+    any number of times persists exactly one row. A suspicion against a named
+    model permanently places that model under observation."""
+    device_id = _device_id_header(x_device_id)
+    _device_or_404(db, device_id)
+    out = notary_service.report_suspicion(
+        db,
+        device_id=device_id,
+        kind=body.kind,
+        model=body.model,
+        detail=body.detail,
+        material=body.material,
+    )
+    return SuspicionOut(**out)

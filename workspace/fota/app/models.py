@@ -212,3 +212,75 @@ class Release(Base):
     __table_args__ = (
         UniqueConstraint("model", "version", name="uq_release_model_version"),
     )
+
+
+# --- software-supply notarization: append-only Merkle ledger ----------------
+class NotaryLeaf(Base):
+    """One canonical ledger entry appended to the Merkle log. Leaves are
+    append-only and never rewritten: the (entry) content hash is unique, and
+    the request token that registered it is unique, so a retried registration
+    can never create a second leaf."""
+    __tablename__ = "notary_leaves"
+
+    # 1-based tree position (0 would mean "empty tree").
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)       # root | release
+    ref: Mapped[str] = mapped_column(String(64), nullable=False)        # root version / release id
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    entry_json: Mapped[str] = mapped_column(Text, nullable=False)       # canonical entry
+    leaf_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    request_token: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NotaryCheckpoint(Base):
+    """A notary-key-signed checkpoint over the log. Canonical checkpoints are
+    unique per tree size (one honest checkpoint per height); an ALTERNATE
+    same-size checkpoint carrying a valid signature but a different root is
+    evidence of equivocation and is retained — never replacing the canonical
+    one — to drive the affected model(s) into quarantine."""
+    __tablename__ = "notary_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tree_size: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    root: Mapped[str] = mapped_column(String(64), nullable=False)
+    checkpoint_json: Mapped[str] = mapped_column(Text, nullable=False)   # canonical cp body
+    signatures_json: Mapped[str] = mapped_column(Text, nullable=False)   # canonical JSON
+    canonical: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("tree_size", "root", name="uq_notary_cp_size_root"),
+    )
+
+
+class QuarantinedModel(Base):
+    """A model permanently placed under observation after notarization
+    equivocation/tampering evidence. Survives process restarts (it is a
+    regular durable table); new claims for the model are blocked while devices
+    already in the flash critical region are allowed to finish."""
+    __tablename__ = "quarantined_models"
+
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NotarySuspicion(Base):
+    """Durable, queryable evidence a node reported when a witness failed
+    verification (tampered witness bytes, unlinkable history, tree shrink,
+    same-height different-root). Deduplicated by the hash of the evidence
+    itself: submitting the same material twice stores exactly one row."""
+    __tablename__ = "notary_suspicions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False)  # canonical evidence
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    duplicate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

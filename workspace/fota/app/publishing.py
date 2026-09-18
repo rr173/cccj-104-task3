@@ -24,6 +24,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import notary as nlib
+from . import notary_service
 from . import trust as trustlib
 from .models import Image, Release, RootMetadata
 
@@ -118,6 +120,15 @@ def publish_root(db: Session, *, metadata: dict, signatures: list, idempotency_k
                 raise Conflict("idempotency_key_conflict")
             return _root_out(dup, duplicate=True)
 
+        # A leaf already settled under this token (e.g. crash before the HTTP
+        # response): return it as a duplicate instead of inserting anything.
+        leaf = notary_service.leaf_by_token(db, idempotency_key)
+        if leaf is not None:
+            row = db.scalar(select(RootMetadata).where(RootMetadata.version == int(leaf.ref)))
+            if row is not None and row.content_hash == chash:
+                return _root_out(row, duplicate=True)
+            raise Conflict("idempotency_key_conflict")
+
         cur = current_root(db)
         try:
             version = int((metadata or {}).get("version"))
@@ -143,6 +154,18 @@ def publish_root(db: Session, *, metadata: dict, signatures: list, idempotency_k
             idempotency_key=idempotency_key,
         )
         db.add(row)
+        db.flush()
+        # Trust handoff -> one ledger leaf, settled in the SAME transaction as
+        # the root row and the signed checkpoint (no claimable-without-record
+        # window; the idempotency key doubles as the leaf request token).
+        notary_service.append_entry(
+            db,
+            kind=nlib.ENTRY_KIND_ROOT,
+            ref=str(version),
+            model=None,
+            payload_sha256=chash,
+            request_token=idempotency_key,
+        )
         try:
             db.commit()
         except IntegrityError:
@@ -192,6 +215,15 @@ def publish_release(
             if dup.content_hash != chash:
                 raise Conflict("idempotency_key_conflict")
             return _release_out(dup, duplicate=True)
+
+        # Crash-before-response replay: a leaf under this token means the
+        # release row settled together with it in a prior attempt.
+        leaf = notary_service.leaf_by_token(db, idempotency_key)
+        if leaf is not None:
+            row = db.scalar(select(Release).where(Release.id == leaf.ref))
+            if row is not None and row.content_hash == chash:
+                return _release_out(row, duplicate=True)
+            raise Conflict("idempotency_key_conflict")
 
         if not isinstance(metadata, dict) or metadata.get("type") != "release":
             raise Validation("malformed_release_metadata")
@@ -255,6 +287,19 @@ def publish_release(
             idempotency_key=idempotency_key,
         )
         db.add(row)
+        db.flush()
+        # Binary-artifact registration -> one ledger leaf + signed checkpoint,
+        # all in THIS transaction with the release row. A forced kill here rolls
+        # everything back together: the artifact can never be claimable while
+        # absent from the ledger, and a token retry settles exactly one leaf.
+        notary_service.append_entry(
+            db,
+            kind=nlib.ENTRY_KIND_RELEASE,
+            ref=row.id,
+            model=image.model,
+            payload_sha256=image.sha256,
+            request_token=idempotency_key,
+        )
         try:
             db.commit()
         except IntegrityError:

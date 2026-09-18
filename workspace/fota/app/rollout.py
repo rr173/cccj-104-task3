@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import publishing
+from . import notary_service, publishing
 from .models import (
     ALLOWED_TRANSITIONS,
     BATCH_ACTIVE,
@@ -60,6 +60,7 @@ REASON_BATCH_HALTED = "batch_halted"
 REASON_QUOTA_FULL = "quota_full"
 REASON_TERMINAL = "terminal"
 REASON_NO_SIGNED_RELEASE = "no_signed_release"
+REASON_MODEL_QUARANTINED = "model_quarantined"
 
 # Device receipts that move the FSM (telemetry-only events have no state entry).
 EVENT_TO_STATE: dict[str, str] = {
@@ -109,6 +110,9 @@ class Offer:
     # client must finish the pending install and then report. Never abort.
     finalize_only: bool = False
     install_state: str = STATE_ASSIGNED
+    # Supply-notarization witness bundle (membership + continuity). The node
+    # verifies both before touching the standby partition.
+    notary: dict | None = None
 
 
 @dataclass
@@ -155,8 +159,14 @@ def _manifest_chunks(image: Image) -> list[dict]:
     ]
 
 
-def _make_offer(db: Session, device: Device, assignment: Assignment, image: Image) -> Offer:
+def _make_offer(db: Session, device: Device, assignment: Assignment, image: Image,
+                *, notary_old_size: int = 0) -> Offer:
     rel = publishing.release_for_image(db, image.id)
+    notary_bundle = None
+    if rel is not None:
+        notary_bundle = notary_service.bundle_for_kind_ref(
+            db, "release", rel.id, notary_old_size
+        )
     return Offer(
         assignment_id=assignment.id,
         campaign_id=assignment.campaign_id,
@@ -172,6 +182,7 @@ def _make_offer(db: Session, device: Device, assignment: Assignment, image: Imag
         release=publishing.release_envelope(rel) if rel is not None else None,
         finalize_only=assignment.install_state in PAST_DOWNLOAD_STATES,
         install_state=assignment.install_state,
+        notary=notary_bundle,
     )
 
 
@@ -214,7 +225,12 @@ def _candidate_batches(db: Session, device: Device) -> list[tuple[Batch, Campaig
 # ----------------------------------------------------------------------------- #
 # Check-in
 # ----------------------------------------------------------------------------- #
-def check_in(db: Session, device: Device, device_root_version: int = 0) -> CheckInResult:
+def check_in(
+    db: Session,
+    device: Device,
+    device_root_version: int = 0,
+    notary_old_size: int = 0,
+) -> CheckInResult:
     # Serialize the whole read-modify-write: prevents two concurrent check-ins
     # of the same device from racing, and keeps per-process seat claims atomic.
     # The UNIQUE(device,campaign) constraint remains the durable backstop.
@@ -242,8 +258,18 @@ def check_in(db: Session, device: Device, device_root_version: int = 0) -> Check
 
             if asg.install_state in CRITICAL_STATES:
                 # Flash writes in progress: always allow finishing + reporting.
+                # The notarization quarantine must not strand a node mid-flash.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+                return CheckInResult(
+                    device,
+                    _make_offer(db, device, asg, image, notary_old_size=notary_old_size),
+                    trust=trust,
+                )
+            if notary_service.is_quarantined(db, image.model):
+                # Observation zone: a node that never touched the standby
+                # partition must stop; the active partition stays bootable.
+                db.commit()
+                return CheckInResult(device, None, REASON_MODEL_QUARANTINED, trust=trust)
             if batch.state == BATCH_PAUSED:
                 db.commit()
                 return CheckInResult(device, None, REASON_BATCH_PAUSED, trust=trust)
@@ -254,13 +280,21 @@ def check_in(db: Session, device: Device, device_root_version: int = 0) -> Check
                 # assigned/downloading/downloaded: serve manifest so the client
                 # resumes verified blocks or proceeds to install.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+                return CheckInResult(
+                    device,
+                    _make_offer(db, device, asg, image, notary_old_size=notary_old_size),
+                    trust=trust,
+                )
 
         # No live assignment: claim a seat in an active batch.
-        return _claim_new(db, device, trust)
+        return _claim_new(db, device, trust, notary_old_size)
 
 
-def _claim_new(db: Session, device: Device, trust: dict) -> CheckInResult:
+def _claim_new(db: Session, device: Device, trust: dict, notary_old_size: int = 0) -> CheckInResult:
+    if notary_service.is_quarantined(db, device.model):
+        # New claims from a quarantined model are blocked fleet-wide.
+        db.commit()
+        return CheckInResult(device, None, REASON_MODEL_QUARANTINED, trust=trust)
     candidates = _candidate_batches(db, device)
     if not candidates:
         db.commit()
@@ -295,7 +329,11 @@ def _claim_new(db: Session, device: Device, trust: dict) -> CheckInResult:
             db.rollback()
             return CheckInResult(device, None, REASON_QUOTA_FULL, trust=trust)
         db.refresh(asg)
-        return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
+        return CheckInResult(
+            device,
+            _make_offer(db, device, asg, image, notary_old_size=notary_old_size),
+            trust=trust,
+        )
 
     db.commit()
     reason = REASON_NO_SIGNED_RELEASE if saw_unsigned else REASON_QUOTA_FULL
@@ -318,6 +356,10 @@ def authorize_chunk(
     batch = db.get(Batch, asg.batch_id)
     if asg.install_state in CRITICAL_STATES:
         return asg, image, None  # critical-region finish path stays open
+    if notary_service.is_quarantined(db, image.model):
+        # Quarantine closes the path before any standby-partition write for
+        # devices that have not started flashing.
+        return asg, None, "model_quarantined"
     if batch.state == BATCH_PAUSED:
         return asg, None, "batch_paused"
     if batch.state == BATCH_HALTED:

@@ -35,6 +35,36 @@ class TrustBundle(BaseModel):
     root_chain: list[Envelope] = Field(default_factory=list)
 
 
+class NotaryCheckpoint(BaseModel):
+    tree_size: int
+    root: str
+    time: str
+    signatures: list[dict[str, str]] = Field(default_factory=list)
+
+
+class NotaryLeafRef(BaseModel):
+    index: int
+    entry: dict[str, Any]
+
+
+class NotaryConsistency(BaseModel):
+    old_size: int
+    new_size: int
+    proof: list[str] = Field(default_factory=list)
+
+
+class NotaryBundle(BaseModel):
+    """Supply-notarization witness carried with every offer: the signed
+    current checkpoint, the offered entry with its membership witness, and the
+    continuous (append-only) witness from the node's remembered checkpoint."""
+    key_id: str
+    public: str
+    checkpoint: NotaryCheckpoint
+    leaf: NotaryLeafRef
+    inclusion: list[str] = Field(default_factory=list)
+    consistency: NotaryConsistency
+
+
 class OfferOut(BaseModel):
     assignment_id: str
     campaign_id: str
@@ -50,6 +80,7 @@ class OfferOut(BaseModel):
     # Signed release envelope the device must validate before the critical
     # write phase (None only defensively — unsigned images are never offered).
     release: Envelope | None = None
+    notary: NotaryBundle | None = None
 
 
 class CheckInResponse(BaseModel):
@@ -76,6 +107,21 @@ class EventOut(BaseModel):
     from_state: str | None = None
     to_state: str | None = None
     halted_batch_ids: list[str] = Field(default_factory=list)
+
+
+# ----- notarization: node-reported witness evidence -----
+class SuspicionIn(BaseModel):
+    # witness_tampered | broken_chain | tree_shrink | equivocation | ...
+    kind: str = Field(min_length=3, max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+    detail: str = Field(default="", max_length=4000)
+    material: dict[str, Any] = Field(default_factory=dict)
+
+
+class SuspicionOut(BaseModel):
+    id: int
+    duplicate: bool
+    quarantined: list[str] = Field(default_factory=list)
 
 
 # ----- admin side -----
